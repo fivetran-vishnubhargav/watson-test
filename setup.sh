@@ -22,7 +22,7 @@ sudo chown "$USER":"$USER" /opt/watson
 
 # Copy your project files into /opt/watson before running this script,
 # or uncomment the git clone line below if you're using a repo:
-# git clone https://github.com/your-org/watson.git /opt/watson
+git clone https://github.com/fivetran-vishnubhargav/watson-test.git /opt/watson
 
 # ── 3. Python virtual environment ─────────────────────────────
 echo "[3/6] Setting up Python virtual environment..."
