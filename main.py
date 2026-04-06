@@ -8,13 +8,20 @@ Flow:
   POST /analyze  →  202 Accepted  +  job_id   (immediate)
   [background]   →  investigation runs async
   GET  /jobs/{job_id}  →  status + result when done
+
+Storage:
+  All job state lives in Redis (localhost:6379).
+  Jobs expire automatically after 24 hours.
+  All 4 gunicorn workers share the same Redis, so any worker
+  can answer any status poll correctly.
 """
 
 import uuid
-import asyncio
+import json
 from datetime import datetime, timezone
 from typing import Optional
 
+import redis
 from fastapi import FastAPI, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -30,14 +37,59 @@ app = FastAPI(
     description="AI-powered initial investigation for Zendesk tickets",
 )
 
-# Allow requests from the Zendesk sidebar (CORS).
-# Lock this down to your Zendesk domain in production.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
+
+
+# ── Redis connection ───────────────────────────────────────────────────────
+# Connects to Redis running locally on the same VM.
+# decode_responses=True means Redis returns strings instead of raw bytes.
+
+_redis = redis.Redis(host="localhost", port=6379, db=0, decode_responses=True)
+
+# How long to keep job data in Redis after completion.
+# After this time Redis automatically deletes the key — no manual cleanup needed.
+JOB_TTL_SECONDS = 60 * 60 * 24  # 24 hours
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _job_key(job_id: str) -> str:
+    """Redis key format for a job."""
+    return f"watson:job:{job_id}"
+
+
+def _save_job(job: dict) -> None:
+    """Serialise job dict to JSON and write to Redis with a 24h TTL."""
+    _redis.set(_job_key(job["job_id"]), json.dumps(job), ex=JOB_TTL_SECONDS)
+
+
+def _load_job(job_id: str) -> Optional[dict]:
+    """Read a job from Redis. Returns None if not found or expired."""
+    raw = _redis.get(_job_key(job_id))
+    if raw is None:
+        return None
+    return json.loads(raw)
+
+
+def _update_job(job_id: str, **fields) -> None:
+    """
+    Load a job, apply field updates, and save it back.
+    e.g. _update_job(job_id, status="running")
+    """
+    job = _load_job(job_id)
+    if job is None:
+        return
+    job.update(fields)
+    _save_job(job)
 
 
 # ── Data models ────────────────────────────────────────────────────────────
@@ -61,27 +113,20 @@ class JobRecord(BaseModel):
     error: Optional[str] = None
 
 
-# ── In-memory job store ────────────────────────────────────────────────────
-# Fine for a single VM. When you scale to multiple VMs, swap this dict
-# for Redis (pip install redis) so all instances share state.
-
-_jobs: dict[str, dict] = {}
-
-
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
 # ── Routes ─────────────────────────────────────────────────────────────────
 
 @app.get("/health")
 async def health():
-    """Quick liveness check. GCP health checks hit this endpoint."""
-    running = sum(1 for j in _jobs.values() if j["status"] == "running")
+    """Liveness check. Also verifies Redis is reachable."""
+    try:
+        _redis.ping()
+        redis_status = "ok"
+    except Exception as e:
+        redis_status = f"error: {e}"
+
     return {
         "status": "ok",
-        "active_jobs": running,
-        "total_jobs_seen": len(_jobs),
+        "redis": redis_status,
     }
 
 
@@ -89,13 +134,12 @@ async def health():
 async def analyze(request: AnalyzeRequest, background_tasks: BackgroundTasks):
     """
     Accepts an investigation request and returns immediately with a job_id.
-    The actual work runs in the background so the Zendesk sidebar doesn't
-    time out waiting.
+    The actual investigation runs in the background.
     """
     job_id = str(uuid.uuid4())
 
-    # Register the job before starting background work
-    _jobs[job_id] = {
+    # Write job to Redis before starting background work
+    job = {
         "job_id": job_id,
         "ticket_id": request.ticket_id,
         "group_id": request.group_id,
@@ -106,8 +150,9 @@ async def analyze(request: AnalyzeRequest, background_tasks: BackgroundTasks):
         "result": None,
         "error": None,
     }
+    _save_job(job)
 
-    # Hand off to background — this returns immediately to the caller
+    # Schedule investigation — runs after this response is sent
     background_tasks.add_task(_process_job, job_id, request)
 
     return {
@@ -122,22 +167,32 @@ async def analyze(request: AnalyzeRequest, background_tasks: BackgroundTasks):
 @app.get("/jobs/{job_id}", response_model=JobRecord)
 async def get_job(job_id: str):
     """
-    Poll this endpoint to check investigation progress.
-    Returns the full result once status == 'complete'.
+    Poll this to check progress. Returns the full result when status == complete.
+    Jobs expire from Redis after 24 hours.
     """
-    job = _jobs.get(job_id)
+    job = _load_job(job_id)
     if not job:
-        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found.")
+        raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found or expired.")
     return job
 
 
 @app.get("/jobs")
 async def list_jobs(limit: int = 50):
-    """Returns the most recent jobs (newest first). Useful for debugging."""
-    all_jobs = sorted(_jobs.values(), key=lambda j: j["created_at"], reverse=True)
+    """
+    Returns recent jobs. Scans Redis for all watson:job:* keys.
+    Useful for debugging — don't call this in a hot loop in production.
+    """
+    keys = _redis.keys("watson:job:*")
+    jobs = []
+    for key in keys:
+        raw = _redis.get(key)
+        if raw:
+            jobs.append(json.loads(raw))
+
+    jobs.sort(key=lambda j: j["created_at"], reverse=True)
     return {
-        "jobs": all_jobs[:limit],
-        "total": len(_jobs),
+        "jobs": jobs[:limit],
+        "total": len(jobs),
     }
 
 
@@ -145,20 +200,17 @@ async def list_jobs(limit: int = 50):
 
 async def _process_job(job_id: str, request: AnalyzeRequest):
     """
-    Runs the investigation pipeline and writes the result back to the job store.
-    Any exception is caught so the server keeps running.
+    Runs the full investigation pipeline.
+    Writes status updates to Redis so any worker can serve the poll requests.
     """
-    _jobs[job_id]["status"] = "running"
+    _update_job(job_id, status="running")
     try:
         result = await run_investigation(
             ticket_id=request.ticket_id,
             group_id=request.group_id,
             schema_name=request.schema_name,
         )
-        _jobs[job_id]["status"] = "complete"
-        _jobs[job_id]["result"] = result
+        _update_job(job_id, status="complete", result=result, completed_at=_now())
+
     except Exception as exc:
-        _jobs[job_id]["status"] = "failed"
-        _jobs[job_id]["error"] = str(exc)
-    finally:
-        _jobs[job_id]["completed_at"] = _now()
+        _update_job(job_id, status="failed", error=str(exc), completed_at=_now())
